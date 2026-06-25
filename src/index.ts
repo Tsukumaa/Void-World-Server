@@ -1,15 +1,3 @@
-import { WebSocketServer, WebSocket } from "ws";
-import { createServer } from "http";
-import express from "express";
-import cors from "cors";
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer });
-
 interface Player {
   id: string;
   username: string;
@@ -17,73 +5,125 @@ interface Player {
   y: number;
   direction: string;
   moving: boolean;
-  ws: WebSocket;
 }
 
-const players = new Map<string, Player>();
-let nextId = 1;
+export class WorldRoom implements DurableObject {
+  private state: DurableObjectState;
+  private players = new Map<string, Player>();
+  private wsToId = new Map<WebSocket, string>();
+  private nextId = 1;
 
-function broadcast(data: object, exclude?: string) {
-  const msg = JSON.stringify(data);
-  players.forEach((p) => {
-    if (p.id !== exclude && p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(msg);
+  constructor(state: DurableObjectState) {
+    this.state = state;
+    // Ping auto toutes les 30s pour garder les connexions vivantes
+    this.state.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair("ping", "pong")
+    );
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
     }
-  });
-}
 
-wss.on("connection", (ws) => {
-  const id = String(nextId++);
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("WebSocket attendu", { status: 426 });
+    }
 
-  ws.on("message", (raw) => {
-    const msg = JSON.parse(raw.toString());
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.state.acceptWebSocket(server);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    let msg: any;
+    try { msg = JSON.parse(message as string); } catch { return; }
 
     if (msg.type === "join") {
-      const player: Player = { id, username: msg.username, x: 400, y: 300, direction: "down", moving: false, ws };
-      players.set(id, player);
+      const id = String(this.nextId++);
+      const player: Player = {
+        id, username: msg.username ?? "Joueur",
+        x: 2400, y: 1920, direction: "down", moving: false,
+      };
+      this.players.set(id, player);
+      this.wsToId.set(ws, id);
 
-      // envoie au nouveau joueur son id + tous les joueurs existants
-      ws.send(JSON.stringify({ type: "init", id, players: [...players.values()].filter(p => p.id !== id).map(({ ws: _, ...p }) => p) }));
+      // Envoie au nouveau joueur son id + tous les autres
+      ws.send(JSON.stringify({
+        type: "init", id,
+        players: [...this.players.values()].filter(p => p.id !== id),
+      }));
 
-      // annonce aux autres
-      broadcast({ type: "player_join", player: { id, username: player.username, x: player.x, y: player.y, direction: player.direction, moving: player.moving } }, id);
+      // Annonce aux autres
+      this.broadcast({ type: "player_join", player }, id);
       console.log(`${msg.username} joined (${id})`);
     }
 
+    const id = this.wsToId.get(ws);
+    if (!id) return;
+
     if (msg.type === "move") {
-      const player = players.get(id);
+      const player = this.players.get(id);
       if (!player) return;
-      player.x = msg.x;
-      player.y = msg.y;
-      player.direction = msg.direction;
-      player.moving = msg.moving;
-      broadcast({ type: "player_move", id, x: msg.x, y: msg.y, direction: msg.direction, moving: msg.moving }, id);
+      player.x = msg.x; player.y = msg.y;
+      player.direction = msg.direction; player.moving = msg.moving;
+      this.broadcast({ type: "player_move", id, x: msg.x, y: msg.y, direction: msg.direction, moving: msg.moving }, id);
     }
 
     if (msg.type === "chat") {
-      const player = players.get(id);
+      const player = this.players.get(id);
       if (!player || !msg.text?.trim()) return;
       const text = String(msg.text).slice(0, 100);
-      broadcast({ type: "chat", id, text }, undefined);
+      this.broadcast({ type: "chat", id, text });
     }
 
     if (msg.type === "dm") {
-      const from = players.get(id);
-      const to = players.get(String(msg.toId));
-      if (!from || !to || !msg.text?.trim()) return;
+      const from = this.players.get(id);
+      if (!from || !msg.text?.trim()) return;
       const text = String(msg.text).slice(0, 500);
-      if (to.ws.readyState === WebSocket.OPEN) {
-        to.ws.send(JSON.stringify({ type: "dm", fromId: id, fromName: from.username, text }));
-      }
+      const toId = String(msg.toId);
+      const toWs = [...this.wsToId.entries()].find(([, pid]) => pid === toId)?.[0];
+      if (toWs) toWs.send(JSON.stringify({ type: "dm", fromId: id, fromName: from.username, text }));
     }
-  });
+  }
 
-  ws.on("close", () => {
-    players.delete(id);
-    broadcast({ type: "player_leave", id });
+  async webSocketClose(ws: WebSocket) {
+    const id = this.wsToId.get(ws);
+    if (!id) return;
+    this.players.delete(id);
+    this.wsToId.delete(ws);
+    this.broadcast({ type: "player_leave", id });
     console.log(`Player ${id} left`);
-  });
-});
+  }
 
-const port = Number(process.env.PORT ?? 2567);
-httpServer.listen(port, () => console.log(`Void World server running on port ${port}`));
+  async webSocketError(ws: WebSocket) {
+    await this.webSocketClose(ws);
+  }
+
+  private broadcast(data: object, excludeId?: string) {
+    const msg = JSON.stringify(data);
+    for (const [ws, pid] of this.wsToId) {
+      if (pid === excludeId) continue;
+      try { ws.send(msg); } catch {}
+    }
+  }
+}
+
+export interface Env {
+  WORLD_ROOM: DurableObjectNamespace;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const id = env.WORLD_ROOM.idFromName("main");
+    const room = env.WORLD_ROOM.get(id);
+    return room.fetch(request);
+  },
+};
