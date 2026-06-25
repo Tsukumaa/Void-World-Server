@@ -59,6 +59,13 @@ wss.on("connection", (ws) => {
       player.moving = msg.moving;
       broadcast({ type: "player_move", id, x: msg.x, y: msg.y, direction: msg.direction, moving: msg.moving }, id);
     }
+
+    if (msg.type === "chat") {
+      const player = players.get(id);
+      if (!player || !msg.text?.trim()) return;
+      const text = String(msg.text).slice(0, 100);
+      broadcast({ type: "chat", id, text }, undefined);
+    }
   });
 
   ws.on("close", () => {
