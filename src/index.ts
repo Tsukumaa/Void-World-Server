@@ -66,6 +66,16 @@ wss.on("connection", (ws) => {
       const text = String(msg.text).slice(0, 100);
       broadcast({ type: "chat", id, text }, undefined);
     }
+
+    if (msg.type === "dm") {
+      const from = players.get(id);
+      const to = players.get(String(msg.toId));
+      if (!from || !to || !msg.text?.trim()) return;
+      const text = String(msg.text).slice(0, 500);
+      if (to.ws.readyState === WebSocket.OPEN) {
+        to.ws.send(JSON.stringify({ type: "dm", fromId: id, fromName: from.username, text }));
+      }
+    }
   });
 
   ws.on("close", () => {
