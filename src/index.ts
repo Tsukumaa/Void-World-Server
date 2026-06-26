@@ -12,14 +12,22 @@ export class WorldRoom implements DurableObject {
   private state: DurableObjectState;
   private players = new Map<string, Player>();
   private wsToId = new Map<WebSocket, string>();
-  private nextId = 1;
 
   constructor(state: DurableObjectState) {
     this.state = state;
-    // Ping auto toutes les 30s pour garder les connexions vivantes
+    // Auto-réponse ping/pong sans réveiller la DO de son hibernation
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair("ping", "pong")
     );
+    // Réhydrate l'état en mémoire depuis les WebSockets hibernés (au réveil de la DO,
+    // le constructeur se relance et les maps sont vides → on les reconstruit)
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Player | null;
+      if (att && att.id) {
+        this.players.set(att.id, att);
+        this.wsToId.set(ws, att.id);
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -48,7 +56,7 @@ export class WorldRoom implements DurableObject {
     try { msg = JSON.parse(message as string); } catch { return; }
 
     if (msg.type === "join") {
-      const id = String(this.nextId++);
+      const id = crypto.randomUUID();
       const username = msg.username ?? "Joueur";
 
       // Anti-fantôme : retire du suivi toute connexion existante avec le même pseudo.
@@ -63,15 +71,19 @@ export class WorldRoom implements DurableObject {
         }
       }
 
-      // Position sauvegardée pour ce pseudo (sinon spawn par défaut)
+      // Position : fournie par le client (continuité reconnexion) > sauvegardée > défaut
       const saved = await this.state.storage.get<{ x: number; y: number }>(`pos:${username}`);
+      const px = typeof msg.x === "number" ? msg.x : (saved?.x ?? 2400);
+      const py = typeof msg.y === "number" ? msg.y : (saved?.y ?? 1920);
       const player: Player = {
         id, username,
-        x: saved?.x ?? 2400, y: saved?.y ?? 1920,
+        x: px, y: py,
         direction: "down", moving: false,
       };
       this.players.set(id, player);
       this.wsToId.set(ws, id);
+      // Persiste l'identité/état sur le socket pour survivre à l'hibernation
+      ws.serializeAttachment(player);
 
       // Envoie au nouveau joueur son id + sa position + tous les autres
       ws.send(JSON.stringify({
@@ -95,11 +107,12 @@ export class WorldRoom implements DurableObject {
       player.direction = msg.direction; player.moving = msg.moving;
       this.broadcast({ type: "player_move", id, x: msg.x, y: msg.y, direction: msg.direction, moving: msg.moving }, id);
 
-      // Sauvegarde throttlée (max 1x / 2s par joueur)
+      // Sauvegarde throttlée (max 1x / 2s par joueur) + maj de l'attachment hibernation
       const now = Date.now();
       if (now - (player.lastSavedAt ?? 0) > 2000) {
         player.lastSavedAt = now;
         this.state.storage.put(`pos:${player.username}`, { x: msg.x, y: msg.y });
+        try { ws.serializeAttachment(player); } catch {}
       }
     }
 
