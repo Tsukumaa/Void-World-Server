@@ -51,6 +51,18 @@ export class WorldRoom implements DurableObject {
       const id = String(this.nextId++);
       const username = msg.username ?? "Joueur";
 
+      // Anti-fantôme : retire du suivi toute connexion existante avec le même pseudo.
+      // On NE ferme PAS l'ancien socket (ça déclencherait une guerre de reconnexion) ;
+      // ses futurs messages référenceront un id absent → ignorés.
+      for (const [otherWs, otherId] of [...this.wsToId.entries()]) {
+        const other = this.players.get(otherId);
+        if (other && other.username === username) {
+          this.players.delete(otherId);
+          this.wsToId.delete(otherWs);
+          this.broadcast({ type: "player_leave", id: otherId });
+        }
+      }
+
       // Position sauvegardée pour ce pseudo (sinon spawn par défaut)
       const saved = await this.state.storage.get<{ x: number; y: number }>(`pos:${username}`);
       const player: Player = {
