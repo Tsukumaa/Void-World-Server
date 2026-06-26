@@ -5,6 +5,7 @@ interface Player {
   y: number;
   direction: string;
   moving: boolean;
+  lastSavedAt?: number;
 }
 
 export class WorldRoom implements DurableObject {
@@ -48,22 +49,28 @@ export class WorldRoom implements DurableObject {
 
     if (msg.type === "join") {
       const id = String(this.nextId++);
+      const username = msg.username ?? "Joueur";
+
+      // Position sauvegardée pour ce pseudo (sinon spawn par défaut)
+      const saved = await this.state.storage.get<{ x: number; y: number }>(`pos:${username}`);
       const player: Player = {
-        id, username: msg.username ?? "Joueur",
-        x: 2400, y: 1920, direction: "down", moving: false,
+        id, username,
+        x: saved?.x ?? 2400, y: saved?.y ?? 1920,
+        direction: "down", moving: false,
       };
       this.players.set(id, player);
       this.wsToId.set(ws, id);
 
-      // Envoie au nouveau joueur son id + tous les autres
+      // Envoie au nouveau joueur son id + sa position + tous les autres
       ws.send(JSON.stringify({
         type: "init", id,
+        self: { x: player.x, y: player.y },
         players: [...this.players.values()].filter(p => p.id !== id),
       }));
 
       // Annonce aux autres
       this.broadcast({ type: "player_join", player }, id);
-      console.log(`${msg.username} joined (${id})`);
+      console.log(`${username} joined (${id}) at ${player.x},${player.y}`);
     }
 
     const id = this.wsToId.get(ws);
@@ -75,6 +82,13 @@ export class WorldRoom implements DurableObject {
       player.x = msg.x; player.y = msg.y;
       player.direction = msg.direction; player.moving = msg.moving;
       this.broadcast({ type: "player_move", id, x: msg.x, y: msg.y, direction: msg.direction, moving: msg.moving }, id);
+
+      // Sauvegarde throttlée (max 1x / 2s par joueur)
+      const now = Date.now();
+      if (now - (player.lastSavedAt ?? 0) > 2000) {
+        player.lastSavedAt = now;
+        this.state.storage.put(`pos:${player.username}`, { x: msg.x, y: msg.y });
+      }
     }
 
     if (msg.type === "chat") {
@@ -97,6 +111,11 @@ export class WorldRoom implements DurableObject {
   async webSocketClose(ws: WebSocket) {
     const id = this.wsToId.get(ws);
     if (!id) return;
+    const player = this.players.get(id);
+    // Sauvegarde la position finale
+    if (player) {
+      await this.state.storage.put(`pos:${player.username}`, { x: player.x, y: player.y });
+    }
     this.players.delete(id);
     this.wsToId.delete(ws);
     this.broadcast({ type: "player_leave", id });
