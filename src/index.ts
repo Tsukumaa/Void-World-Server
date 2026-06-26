@@ -141,7 +141,14 @@ export interface Env {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const id = env.WORLD_ROOM.idFromName("main");
+    const url = new URL(request.url);
+    // Room demandée : "main" (monde) ou "house:<pseudo>" (maison instanciée)
+    let roomName = url.searchParams.get("room") ?? "main";
+    // Sécurité : on limite les caractères et la longueur
+    roomName = roomName.slice(0, 60).replace(/[^a-zA-Z0-9:_-]/g, "");
+    if (!roomName) roomName = "main";
+
+    const id = env.WORLD_ROOM.idFromName(roomName);
     const room = env.WORLD_ROOM.get(id);
     return room.fetch(request);
   },
