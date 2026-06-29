@@ -5,6 +5,7 @@ interface Player {
   y: number;
   direction: string;
   moving: boolean;
+  charCfg?: object;
   lastSavedAt?: number;
 }
 
@@ -73,12 +74,13 @@ export class WorldRoom implements DurableObject {
 
       // Position : fournie par le client (continuité reconnexion) > sauvegardée > défaut
       const saved = await this.state.storage.get<{ x: number; y: number }>(`pos:${username}`);
-      const px = typeof msg.x === "number" ? msg.x : (saved?.x ?? 2400);
-      const py = typeof msg.y === "number" ? msg.y : (saved?.y ?? 1920);
+      const px = typeof msg.x === "number" ? msg.x : (saved?.x ?? 1280);
+      const py = typeof msg.y === "number" ? msg.y : (saved?.y ?? 960);
       const player: Player = {
         id, username,
         x: px, y: py,
         direction: "down", moving: false,
+        charCfg: msg.charCfg ?? undefined,
       };
       this.players.set(id, player);
       this.wsToId.set(ws, id);
